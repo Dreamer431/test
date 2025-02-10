@@ -1,0 +1,155 @@
+"""
+FUNCTION：app server
+"""
+import collections
+import hashlib
+import logging
+import sys
+import warnings
+from concurrent import futures
+from rag import Rag
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.exceptions import BadRequest
+
+
+class LRUCache:
+    """
+    lrucache
+    """
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.catch = collections.OrderedDict()
+
+    def get(self, key):
+        """
+        get key
+        """
+        if key not in self.catch:
+            return -1
+
+        value = self.catch.pop(key)
+        self.catch[key] = value
+        return value
+
+    def put(self, key, value) -> None:
+        """
+        pit key
+        """
+        if key in self.catch:
+            self.catch.pop(key)
+        elif self.catch and self.capacity == 0:
+            self.catch.popitem(last=False)
+        else:
+            self.capacity -= 1
+        self.catch[key] = value
+
+
+def cmp_hash(content):
+    """
+    cmp md5
+    """
+    md5hash = hashlib.sha256(content.encode('utf8'))
+    md5 = md5hash.hexdigest()
+    return md5
+
+
+# 创建一个包含代理配置的字典
+executor = futures.ThreadPoolExecutor(max_workers=1)
+app = Flask('Recall_IR')
+CORS(app, resources=r'/*')
+logging.basicConfig(level=logging.INFO)
+warnings.filterwarnings('ignore')
+
+RELATED_FLAG = "related_judge"
+CARD_INFO_NAME = "card_info"
+SUCCESS_NAME = "success"
+DESCRIPTION_NAME = "description"
+AGENT_TYPE = sys.argv[1] if len(sys.argv) >= 2 else "l2&l3"
+logging.info("Agent Type is %s", AGENT_TYPE)
+
+lru_cache = LRUCache(1000000)
+rag = Rag()
+
+def prepare_response(status_code=200, completions=None, err_msg=None):
+    """
+    response 格式
+    """
+    if err_msg is not None or status_code != 200:
+
+        response_json = jsonify({
+            "err_msg": err_msg if err_msg is not None else "inner error"
+        })
+    else:
+        logging.info(completions)
+        if isinstance(completions, str):
+            response_json = completions
+        else:
+            response_json = jsonify(completions)
+
+    return response_json
+
+
+def check_request():
+    """
+    check request
+    """
+    try:
+        req = request.json
+        return req
+
+    except BadRequest:
+        return prepare_response(
+            status_code=500,
+            err_msg=str(BadRequest.description)
+        )
+
+
+def start_server():
+    """
+    Start http server
+    :return:
+    """
+    app.run(host="0.0.0.0", port=8029, threaded=True)
+
+
+@app.route(f'/rag', methods=['POST'])
+def server():
+    """
+    Server Entry
+    """
+    req = check_request()
+    if not isinstance(req, dict):
+        return req, 500
+    logging.info("request is: %s", req)
+    user_input = req['instruction']
+
+    hash_query = "".join(
+        [
+            "".join(req.values())
+        ]
+    )
+    prompt_md5 = cmp_hash(hash_query)
+
+    try:
+        if prompt_md5 not in lru_cache.catch:
+            res = rag.run(user_input)
+            final_text = str(res)
+            lru_cache.put(prompt_md5, {"cmp": final_text})
+        else:
+            res_cache = lru_cache.get(prompt_md5)
+            final_text = res_cache.get("cmp")
+        response = {"result": final_text}
+        return prepare_response(completions=response), response.get("status")
+    except Exception as error:
+        code_description = f"[Internal Error]请求失败，请尝试改写您的描述"
+        print(error)
+        logging.info("Error: %s", error)
+        response = f"{code_description}\n"
+        return prepare_response(completions=response), 400
+
+
+if __name__ == '__main__':
+    logging.info("\n===================== Start Service =====================")
+    executor.submit(start_server)
